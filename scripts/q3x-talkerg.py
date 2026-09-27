@@ -1,10 +1,15 @@
-"""Spike: XPU graph-captured code-predictor for Qwen3-TTS.
+"""Spike: XPU graph capture of BOTH the talker decode step and the code-predictor.
 
-Stack: autotuned inductor (talker + code-predictor) + ONE XPUGraph replaying the
-full 15-step code-predictor sequence per main token (greedy, static buffers).
+No torch.compile anywhere: the talker decode step is an XPUGraph replay with a
+static per-layer KV cache + precomputed additive attention-mask table, and the
+15-step code-predictor is a second XPUGraph. Expect: no inductor absorb, and
+the talker's ~12 ms (autotuned) dropping toward the CP graph's ~15 ms floor.
 
-Correctness: two seeded runs (graph on / graph off) must produce matching audio.
-Usage: python q3x-graph.py
+Correctness: fully-greedy (do_sample=False, subtalker_dosample=False) graph-on
+vs graph-off. Note: static-mask vs is_causal SDPA paths can differ in bf16
+reduction order, so expect high (not perfect) correlation and near-equal
+durations, per faster-qwen3-tts's parity notes.
+Usage: python q3x-talkerg.py
 """
 import functools
 import os
@@ -30,7 +35,7 @@ if not hasattr(_g, "merge_with_config_defaults"):
     print("SHIM: merge_with_config_defaults (passthrough) injected", flush=True)
 
 from qwen_tts import Qwen3TTSModel
-from qwen_tts.xpu_graph import GraphedCodePredictor
+from qwen_tts.xpu_graph import GraphedCodePredictor, GraphedTalkerStep
 
 MODEL_DIR = "/models/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
@@ -42,7 +47,7 @@ TEXT = (
     "several seconds of audio."
 )
 
-SHORT = "Compiling the kernels now. This short sentence absorbs the inductor warm-up."
+SHORT = "Compiling the kernels now. This short sentence absorbs the warm-up."
 
 stats = {}
 
@@ -104,23 +109,6 @@ def ensure_on_xpu(wrapper):
     print("PLACEMENT: all components on xpu", flush=True)
 
 
-def apply_compile(wrapper, compile_cp=False):
-    """Compile talker.model (always) and optionally code_predictor.model.
-
-    With the graph path, the code-predictor is captured EAGER into the XPUGraph:
-    dynamo cannot fake-tensor-trace the custom in-place StaticKVCache, and the
-    dispatch-bound cost is removed by the replay anyway.
-    """
-    kw = {"dynamic": True, "fullgraph": False, "backend": "inductor", "mode": "max-autotune"}
-    talker = wrapper.model.talker
-    talker.model = torch.compile(talker.model, **kw)
-    if compile_cp:
-        talker.code_predictor.model = torch.compile(talker.code_predictor.model, **kw)
-        print("COMPILE: inductor max-autotune applied to talker.model + code_predictor.model", flush=True)
-    else:
-        print("COMPILE: inductor max-autotune applied to talker.model only (CP eager -> graph-captured)", flush=True)
-
-
 def warmup_decode(wrapper):
     buckets = [64, 128, 192, 256, 320, 384, 448, 512]
     st = wrapper.model.speech_tokenizer
@@ -152,38 +140,41 @@ def main():
         MODEL_DIR, device_map="xpu", dtype=torch.bfloat16, attn_implementation="sdpa",
     )
     ensure_on_xpu(wrapper)
-    apply_compile(wrapper)
     warmup_decode(wrapper)
 
-    # Attach the graph-captured code-predictor (captures the compiled cp body).
     talker = wrapper.model.talker
+    real_backbone = talker.model  # keep for the graph-off side
+
+    # Attach BOTH graphs. No torch.compile involved.
+    talker.model = GraphedTalkerStep(real_backbone, max_len=2048)
     talker._cp_graph = GraphedCodePredictor(talker, torch.device("xpu"), torch.bfloat16)
 
-    # Absorb inductor + exercise the graph.
+    # Eager kernel warm-up (no inductor absorb expected).
     t_c = time.monotonic()
     wrapper.generate_custom_voice(text=SHORT, language="English", speaker="Aiden",
                                   non_streaming_mode=True)
     torch.xpu.synchronize()
-    print(f"COMPILE-ABSORB: {time.monotonic()-t_c:.1f}s", flush=True)
+    print(f"WARM-RUN: {time.monotonic()-t_c:.1f}s (no inductor)", flush=True)
     xpu_cleanup()
 
-    # ---- Correctness: seeded graph-on vs graph-off must match ----
-    # subtalker_dosample=False on BOTH sides: the graph path is structurally
-    # greedy (argmax baked in), so the eager path must match it or the
-    # trajectories diverge (different codebooks -> different talker feedback
-    # -> different EOS). Talker first-codebook sampling stays on (seeded).
+    # ---- Correctness: fully-greedy graph-on vs graph-off ----
     def gen(seed):
         torch.manual_seed(seed)
         torch.xpu.manual_seed_all(seed)
-        wavs, sr = wrapper.generate_custom_voice(text=TEXT, language="English", speaker="Aiden",
-                                                 non_streaming_mode=True, subtalker_dosample=False)
+        wavs, sr = wrapper.generate_custom_voice(
+            text=TEXT, language="English", speaker="Aiden", non_streaming_mode=True,
+            do_sample=False, subtalker_dosample=False)
         torch.xpu.synchronize()
         return wavs[0], sr
 
     wav_on, sr = gen(42)
     xpu_cleanup()
-    talker._cp_graph = None  # detach -> eager manual loop
+    # Detach both graphs -> fully eager path.
+    talker._cp_graph = None
+    talker.model = real_backbone
     wav_off, _ = gen(42)
+    # Re-attach for the timed run.
+    talker.model = GraphedTalkerStep(real_backbone, max_len=2048)
     talker._cp_graph = GraphedCodePredictor(talker, torch.device("xpu"), torch.bfloat16)
     xpu_cleanup()
 
@@ -191,10 +182,10 @@ def main():
     n = min(len(a), len(b))
     corr = float(np.corrcoef(a[:n], b[:n])[0, 1]) if n > 10 else float("nan")
     mad = float(np.mean(np.abs(a[:n] - b[:n])))
-    print(f"CORRECTNESS: dur {len(a)/sr:.2f}s vs {len(b)/sr:.2f}s  corr={corr:.5f}  mean_abs_diff={mad:.2e}  "
-          f"rms on/off = {rms(a):.4f}/{rms(b):.4f}", flush=True)
+    print(f"CORRECTNESS: dur {len(a)/sr:.2f}s vs {len(b)/sr:.2f}s  corr={corr:.5f}  "
+          f"mean_abs_diff={mad:.2e}  rms on/off = {rms(a):.4f}/{rms(b):.4f}", flush=True)
 
-    # ---- Timed profile run (graph on) ----
+    # ---- Timed profile run (both graphs on) ----
     hook_module(talker.model, "talker")
     st = wrapper.model.speech_tokenizer
     timed_method(st, "decode", "mimi")
@@ -211,7 +202,7 @@ def main():
     dur = len(wavs[0]) / sr
     print(f"AUDIO: {dur:.1f}s in {gen_secs:.1f}s -> RTF {gen_secs/dur:.2f}x", flush=True)
 
-    print("=== PROFILE graph=True autotune=True ===", flush=True)
+    print("=== PROFILE talker-graph=True cp-graph=True compile=False ===", flush=True)
     tot = {}
     for name, xs in stats.items():
         tot[name] = sum(xs)
@@ -221,8 +212,8 @@ def main():
     known = sum(v for k, v in tot.items() if k != "_generate")
     print(f"{'_generate':16s} total={gen*1000:9.1f}ms  glue(residual)={(gen-known)*1000:9.1f}ms", flush=True)
     print(f"PEAK MEM: {torch.xpu.max_memory_allocated('xpu')/1e9:.2f} GiB", flush=True)
-    sf.write("/out/q3x-graph.wav", wavs[0], sr)
-    print("SAVED /out/q3x-graph.wav", flush=True)
+    sf.write("/out/q3x-talkerg.wav", wavs[0], sr)
+    print("SAVED /out/q3x-talkerg.wav", flush=True)
 
 
 if __name__ == "__main__":
