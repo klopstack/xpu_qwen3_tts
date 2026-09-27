@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.egg-info/
+/out/
+*.wav
+.DS_Store
