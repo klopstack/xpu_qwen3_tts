@@ -168,22 +168,39 @@ def main():
     xpu_cleanup()
 
     # ---- Correctness: seeded graph-on vs graph-off must match ----
-    # subtalker_dosample=False on BOTH sides: the graph path is structurally
-    # greedy (argmax baked in), so the eager path must match it or the
-    # trajectories diverge (different codebooks -> different talker feedback
-    # -> different EOS). Talker first-codebook sampling stays on (seeded).
+    # do_sample=False AND subtalker_dosample=False on BOTH sides: the graph
+    # path is structurally greedy (argmax baked in), so the eager path must
+    # match it or the trajectories diverge (different codebooks -> different
+    # talker feedback -> different EOS).
+    # Token-level check: collect the per-step codec_ids (16 codebooks) from
+    # the talker forward output and compare the sequences directly.
+    codes_box = []
+
+    def _collect(m, inp, out):
+        try:
+            hs = out.hidden_states
+            if isinstance(hs, tuple) and len(hs) == 2 and hs[1] is not None:
+                codes_box.append(hs[1].detach().reshape(-1).cpu())
+        except Exception:
+            pass
+
+    talker.register_forward_hook(_collect)
+
     def gen(seed):
         torch.manual_seed(seed)
         torch.xpu.manual_seed_all(seed)
+        codes_box.clear()
         wavs, sr = wrapper.generate_custom_voice(text=TEXT, language="English", speaker="Aiden",
-                                                 non_streaming_mode=True, subtalker_dosample=False)
+                                                 non_streaming_mode=True,
+                                                 do_sample=False, subtalker_dosample=False)
         torch.xpu.synchronize()
-        return wavs[0], sr
+        codes = torch.cat(codes_box) if codes_box else torch.zeros(0, dtype=torch.long)
+        return wavs[0], sr, codes
 
-    wav_on, sr = gen(42)
+    wav_on, sr, codes_on = gen(42)
     xpu_cleanup()
     talker._cp_graph = None  # detach -> eager manual loop
-    wav_off, _ = gen(42)
+    wav_off, _, codes_off = gen(42)
     talker._cp_graph = GraphedCodePredictor(talker, torch.device("xpu"), torch.bfloat16)
     xpu_cleanup()
 
@@ -193,6 +210,14 @@ def main():
     mad = float(np.mean(np.abs(a[:n] - b[:n])))
     print(f"CORRECTNESS: dur {len(a)/sr:.2f}s vs {len(b)/sr:.2f}s  corr={corr:.5f}  mean_abs_diff={mad:.2e}  "
           f"rms on/off = {rms(a):.4f}/{rms(b):.4f}", flush=True)
+    n_min = min(codes_on.shape[0], codes_off.shape[0])
+    if n_min:
+        row_eq = (codes_on[:n_min].view(-1, 16) == codes_off[:n_min].view(-1, 16)).all(dim=1)
+        first_bad = int((~row_eq).nonzero().flatten().clamp(max=n_min - 1)[0].item()) if (~row_eq).any() else -1
+        print(f"CODES: on={codes_on.shape[0]} off={codes_off.shape[0]}  "
+              f"prefix_rows_exact={row_eq.float().mean().item():.4f}  first_diverge_row={first_bad}", flush=True)
+    else:
+        print(f"CODES: on={codes_on.shape[0]} off={codes_off.shape[0]} (no overlap)", flush=True)
 
     # ---- Timed profile run (graph on) ----
     hook_module(talker.model, "talker")

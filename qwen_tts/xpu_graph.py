@@ -16,6 +16,14 @@ import torch
 from transformers.cache_utils import Cache
 
 
+class _PlaceholderLayer:
+    """Stand-in for a StaticCache layer entry (see StaticKVCache.layers)."""
+    is_compileable = False
+
+
+_PLACEHOLDER_LAYER = _PlaceholderLayer()
+
+
 class StaticKVCache(Cache):
     """Fixed-size KV cache with in-place writes (graph-capture safe).
 
@@ -41,6 +49,9 @@ class StaticKVCache(Cache):
         # Explicit write position (talker graph: mutable cache_position buffer).
         # None -> derive from _len (CP graph: constant layout).
         self._write_pos = None
+        # Incoming tokens for the in-flight forward (talker prefill: the mask
+        # builder asks get_mask_sizes BEFORE update() runs).
+        self._incoming = 0
         # return_full: True -> update() returns the FULL max_len buffer (talker
         # graph: an explicit additive mask spans the whole buffer). False ->
         # returns the growing :_len view (CP graph: create_causal_mask sizes the
@@ -56,6 +67,7 @@ class StaticKVCache(Cache):
         self.k[layer_idx, :, :, i:i + t, :].copy_(key_states)
         self.v[layer_idx, :, :, i:i + t, :].copy_(value_states)
         self._len = max(self._len, i + t)
+        self._incoming = 0
         if self.return_full:
             # Stable full-length buffers; future positions are hidden by the
             # caller's additive mask.
@@ -63,13 +75,27 @@ class StaticKVCache(Cache):
         return (self.k[layer_idx, :, :, :self._len, :],
                 self.v[layer_idx, :, :, :self._len, :])
 
+    @property
+    def layers(self):
+        # transformers 4.57.3 touches this in two places:
+        #  - _preprocess_mask_arguments: `layer_idx >= len(pkv.layers)` (length
+        #    probe for not-yet-created DynamicCache layers)
+        #  - Cache.is_compileable: `len(self.layers) == 0` then
+        #    `all(layer.is_compileable ...)` (called by
+        #    prepare_inputs_for_generation every decode step)
+        # Report one placeholder per real layer. is_compileable=False keeps
+        # prepare_inputs_for_generation from pre-building a 4D mask each step
+        # (the graph supplies its own static mask).
+        return [_PLACEHOLDER_LAYER] * self.k.shape[0]
+
     def get_seq_length(self):
         return self._len
 
     def get_mask_sizes(self, cache_position, layer_idx: int = 0):
         # Called by create_causal_mask BEFORE the update(); report the
-        # post-update length (matches DynamicCache semantics).
-        return self._len + cache_position.shape[0], 0
+        # post-update length (matches DynamicCache semantics). _incoming covers
+        # the talker prefill, where the mask is built before any update() ran.
+        return self._len + self._incoming, 0
 
     def get_max_cache_shape(self, layer_idx: int = 0):
         return self._max_len
